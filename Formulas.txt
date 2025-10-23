@@ -1,0 +1,10 @@
+Inter Arrival Time: =IF(E5<126,1,IF(E5<251,2,IF(E5<376,3,IF(E5<501,4, IF(E5<626,5,IF(E5<751,6,IF(E5<876,7,IF(E5<1000,8)))))))); Where E refers to Random Number for IAT
+Arrival Time: Previous Arrival Time+ Inter Arrival Time
+Random Number for ST: Random Number between 100
+Service Time: =IF(G4<30,1,IF(G4<50,2,IF(G4<60,3,IF(G4<65,4,IF(G4<75,5,IF(G4<100,6)))))): Where G refers to Random Number for ST
+Time Service Begin: MAX(Previous state of Time Service End, Arrival Time)
+Waiting Time: Time Service Begin - Arrival time
+Time Service End: Service Time + Time Service Begin
+Time Spent in System: Service time + waiting time
+Idle Time of Server: Previous state of Time Service Begin- Time service End
+ 
