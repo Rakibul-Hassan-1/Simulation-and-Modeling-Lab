@@ -1,422 +1,285 @@
-import React, { useMemo, useState } from "react";
-import seedrandom from "seedrandom";
-import { Card, CardContent } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
-import { Label } from "@/components/ui/label";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { Switch } from "@/components/ui/switch";
-import { Info, RotateCcw, Play } from "lucide-react";
-import {
-  ResponsiveContainer,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  Tooltip,
-  BarChart,
-  Bar,
-  CartesianGrid,
-  Legend,
-} from "recharts";
+# app.py
+# Single-Server Queue Simulator — Streamlit App
+# ---------------------------------------------
+# Features:
+# - Clean UI with sidebar controls
+# - Provide custom RN lists (textarea) or random generation
+# - Optional seed for reproducibility
+# - KPI cards (avg wait, max wait, idle, utilization, horizon end)
+# - Charts (Wait by customer, TSE timeline, Wait histogram)
+# - Results table
+# - CSV download buttons (results & summaries)
+#
+# Run:
+#   pip install streamlit pandas altair
+#   streamlit run app.py
 
-// ==========================
-// Types
-// ==========================
-interface SimulationInput {
-  nCustomers: number;
-  rnIat?: number[]; // 1..1000
-  rnSt?: number[];  // 1..100
-}
+from dataclasses import dataclass
+from typing import List, Optional
+import random
+import pandas as pd
+import streamlit as st
+import altair as alt
 
-interface Row {
-  Cust: number;
-  RN_IAT: number;
-  IAT: number;
-  Arrival: number;
-  RN_ST: number;
-  ST: number;
-  TSB: number;
-  Wait: number;
-  TSE: number;
-  TimeInSystem: number;
-  ServerIdle: number;
-}
+# --------------------------
+# Mapping functions (Excel logic, inclusive final bucket)
+# --------------------------
+def inter_arrival_time_from_rn(rn: int) -> int:
+    # 1..1000 -> IAT
+    if rn < 126: return 1
+    if rn < 251: return 2
+    if rn < 376: return 3
+    if rn < 501: return 4
+    if rn < 626: return 5
+    if rn < 751: return 6
+    if rn < 876: return 7
+    if rn <= 1000: return 8
+    raise ValueError("IAT RN must be in 1..1000")
 
-interface Summary {
-  avgWait: number;
-  maxWait: number;
-  totalIdle: number;
-  utilization: number; // 0..1
-  horizonEnd: number;
-}
+def service_time_from_rn(rn: int) -> int:
+    # 1..100 -> ST
+    if rn < 30: return 1
+    if rn < 50: return 2
+    if rn < 60: return 3
+    if rn < 65: return 4
+    if rn < 75: return 5
+    if rn <= 100: return 6
+    raise ValueError("ST RN must be in 1..100")
 
-// ==========================
-// Mapping functions (ported from Python)
-// ==========================
-function interArrivalTimeFromRn(rn: number): number {
-  if (rn < 1 || rn > 1000) throw new Error("IAT RN must be 1..1000");
-  if (rn < 126) return 1;
-  if (rn < 251) return 2;
-  if (rn < 376) return 3;
-  if (rn < 501) return 4;
-  if (rn < 626) return 5;
-  if (rn < 751) return 6;
-  if (rn < 876) return 7;
-  return 8; // rn <= 1000
-}
+# --------------------------
+# Simulation core
+# --------------------------
+@dataclass
+class SimulationInput:
+    n_customers: int
+    rn_iat: Optional[List[int]] = None    # values 1..1000
+    rn_st: Optional[List[int]] = None     # values 1..100
 
-function serviceTimeFromRn(rn: number): number {
-  if (rn < 1 || rn > 100) throw new Error("ST RN must be 1..100");
-  if (rn < 30) return 1;
-  if (rn < 50) return 2;
-  if (rn < 60) return 3;
-  if (rn < 65) return 4;
-  if (rn < 75) return 5;
-  return 6; // rn <= 100
-}
+def simulate_queue(sim_in: SimulationInput) -> pd.DataFrame:
+    n = sim_in.n_customers
+    if n <= 0:
+        raise ValueError("n_customers must be >= 1")
 
-// ==========================
-// Simulation core (TypeScript)
-// ==========================
-function simulateQueue(input: SimulationInput): { rows: Row[]; summary: Summary } {
-  const n = input.nCustomers;
-  if (n <= 0) throw new Error("nCustomers must be >= 1");
+    # Generate RN if not provided
+    rn_iat = sim_in.rn_iat if sim_in.rn_iat is not None else [random.randint(1, 1000) for _ in range(n)]
+    rn_st  = sim_in.rn_st  if sim_in.rn_st  is not None else [random.randint(1, 100)  for _ in range(n)]
+    if len(rn_iat) != n or len(rn_st) != n:
+        raise ValueError("Length of rn_iat and rn_st must equal n_customers.")
 
-  const rnIat = input.rnIat ?? new Array(n).fill(0).map(() => 1 + Math.floor(Math.random() * 1000));
-  const rnSt = input.rnSt ?? new Array(n).fill(0).map(() => 1 + Math.floor(Math.random() * 100));
-  if (rnIat.length !== n || rnSt.length !== n) throw new Error("RN lengths must equal nCustomers");
+    # Inter-arrival times from RN (we’ll override first to 0)
+    iat = [inter_arrival_time_from_rn(x) for x in rn_iat]
+    iat[0] = 0  # First customer starts the system
 
-  const iat = rnIat.map(interArrivalTimeFromRn);
-  iat[0] = 0; // first arrival begins system
+    # Arrival times: first = 0; then cumulative
+    arrival = [0] * n
+    for i in range(1, n):
+        arrival[i] = arrival[i-1] + iat[i]
 
-  const arrival: number[] = new Array(n).fill(0);
-  for (let i = 1; i < n; i++) arrival[i] = arrival[i - 1] + iat[i];
+    # Service times from RN
+    st = [service_time_from_rn(x) for x in rn_st]
 
-  const st = rnSt.map(serviceTimeFromRn);
+    # Time Service Begin (TSB), Waiting Time (WT), Time Service End (TSE),
+    # Time in System (TIS), Server Idle (IDLE)
+    tsb = [0] * n
+    wt  = [0] * n
+    tse = [0] * n
+    tis = [0] * n
+    idle = [0] * n
 
-  const tsb: number[] = new Array(n).fill(0);
-  const wt: number[] = new Array(n).fill(0);
-  const tse: number[] = new Array(n).fill(0);
-  const tis: number[] = new Array(n).fill(0);
-  const idle: number[] = new Array(n).fill(0);
+    # First customer (all zeros except ST & TSE)
+    tse[0] = st[0]  # starts at 0, ends at ST[0]
+    tis[0] = st[0]  # wait 0 + service
 
-  // first customer
-  tse[0] = st[0];
-  tis[0] = st[0];
+    # Rest of customers
+    for i in range(1, n):
+        prev_tse = tse[i-1]
+        tsb[i] = max(prev_tse, arrival[i])
+        wt[i]  = tsb[i] - arrival[i]
+        tse[i] = tsb[i] + st[i]
+        tis[i] = st[i] + wt[i]
+        idle[i] = max(0, tsb[i] - prev_tse)  # server idle gap before starting i
 
-  for (let i = 1; i < n; i++) {
-    const prevTse = tse[i - 1];
-    tsb[i] = Math.max(prevTse, arrival[i]);
-    wt[i] = tsb[i] - arrival[i];
-    tse[i] = tsb[i] + st[i];
-    tis[i] = st[i] + wt[i];
-    idle[i] = Math.max(0, tsb[i] - prevTse);
-  }
+    df = pd.DataFrame({
+        "Cust": range(1, n+1),
+        "RN_IAT(1-1000)": rn_iat,
+        "IAT": iat,
+        "Arrival": arrival,
+        "RN_ST(1-100)": rn_st,
+        "ST": st,
+        "TSB": tsb,
+        "Wait": wt,
+        "TSE": tse,
+        "TimeInSystem": tis,
+        "ServerIdle": idle
+    })
+    return df
 
-  const rows: Row[] = new Array(n).fill(0).map((_, i) => ({
-    Cust: i + 1,
-    RN_IAT: rnIat[i],
-    IAT: iat[i],
-    Arrival: arrival[i],
-    RN_ST: rnSt[i],
-    ST: st[i],
-    TSB: tsb[i],
-    Wait: wt[i],
-    TSE: tse[i],
-    TimeInSystem: tis[i],
-    ServerIdle: idle[i],
-  }));
+# --------------------------
+# Helpers
+# --------------------------
+def parse_csv_ints(s: str) -> List[int]:
+    parts = [p.strip() for p in s.replace("\n", ",").split(",")]
+    ints: List[int] = []
+    for p in parts:
+        if p == "":
+            continue
+        ints.append(int(p))
+    return ints
 
-  const totalService = st.reduce((a, b) => a + b, 0);
-  const totalIdle = idle.reduce((a, b) => a + b, 0);
-  const avgWait = wt.reduce((a, b) => a + b, 0) / n;
-  const maxWait = wt.reduce((a, b) => Math.max(a, b), 0);
-  const utilization = totalService + totalIdle > 0 ? totalService / (totalService + totalIdle) : 0;
-  const horizonEnd = tse[n - 1];
+def compute_summaries(df: pd.DataFrame) -> pd.DataFrame:
+    total_service = int(df["ST"].sum())
+    total_idle = int(df["ServerIdle"].sum())
+    avg_wait = float(df["Wait"].mean())
+    max_wait = int(df["Wait"].max())
+    util = total_service / (total_service + total_idle) if (total_service + total_idle) > 0 else 0.0
+    horizon_end = int(df["TSE"].iloc[-1])
+    return pd.DataFrame({
+        "Metric": [
+            "Average waiting time",
+            "Maximum waiting time",
+            "Total server idle time",
+            "Server utilization (%)",
+            "Simulation horizon end (last TSE)",
+        ],
+        "Value": [
+            f"{avg_wait:.2f}",
+            f"{max_wait}",
+            f"{total_idle}",
+            f"{util*100:.2f}%",
+            f"{horizon_end}",
+        ],
+    })
 
-  return {
-    rows,
-    summary: { avgWait, maxWait, totalIdle, utilization, horizonEnd },
-  };
-}
+# --------------------------
+# Streamlit UI
+# --------------------------
+st.set_page_config(page_title="Single-Server Queue Simulator", page_icon="🧮", layout="wide")
 
-function parseCsvInts(s: string): number[] {
-  return s
-    .replace(/\n/g, ",")
-    .split(",")
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0)
-    .map((p) => parseInt(p, 10));
-}
+st.markdown("""
+# Single-Server Queue Simulator
+Excel-like discrete-event simulation with a clean Streamlit UI.
+""")
 
-function toFixed2(x: number) {
-  return x.toFixed(2);
-}
+with st.sidebar:
+    st.header("Controls")
+    n_customers = st.number_input("Number of customers", min_value=1, value=10, step=1)
 
+    seed_text = st.text_input("Random seed (optional)", value="")
+    if seed_text:
+        try:
+            random.seed(seed_text)
+            st.caption("Seed set for reproducibility.")
+        except Exception:
+            st.warning("Seed could not be set — proceeding without it.")
 
-export default function App() {
-  const [nCustomers, setNCustomers] = useState<number>(10);
-  const [useCustomRn, setUseCustomRn] = useState(false);
-  const [rnIatText, setRnIatText] = useState("");
-  const [rnStText, setRnStText] = useState("");
-  const [seed, setSeed] = useState<string>("");
-  const [runKey, setRunKey] = useState(0);
+    st.divider()
+    use_custom = st.toggle("Provide custom RN lists", value=False, help="If off, RN lists are generated randomly.")
 
-  // Seed effect
-  useMemo(() => {
-    if (seed && seed.trim().length > 0) {
-      seedrandom(seed, { global: true });
-    }
-    // No deps on seedrandom result; this runs on seed change
-  }, [seed, runKey]);
+    rn_iat_str = ""
+    rn_st_str = ""
+    if use_custom:
+        rn_iat_str = st.text_area("RN for IAT (1..1000)", placeholder="e.g. 12, 845, 310, 999, ...", height=120)
+        rn_st_str  = st.text_area("RN for ST (1..100)",  placeholder="e.g. 5, 88, 60, 17, ...", height=120)
+        st.caption("Comma or newline separated. Lengths must equal the number of customers.")
 
-  const [rows, setRows] = useState<Row[] | null>(null);
-  const [summary, setSummary] = useState<Summary | null>(null);
-  const [error, setError] = useState<string | null>(null);
+    run = st.button("Run Simulation", type="primary")
+    reset = st.button("Reset")
 
-  const run = () => {
-    try {
-      setError(null);
-      let rnIat: number[] | undefined = undefined;
-      let rnSt: number[] | undefined = undefined;
-      if (useCustomRn) {
-        rnIat = parseCsvInts(rnIatText);
-        rnSt = parseCsvInts(rnStText);
-      }
-      const { rows, summary } = simulateQueue({ nCustomers, rnIat, rnSt });
-      setRows(rows);
-      setSummary(summary);
-    } catch (e: any) {
-      setError(e?.message ?? String(e));
-      setRows(null);
-      setSummary(null);
-    }
-  };
+if reset:
+    st.experimental_rerun()
 
-  const reset = () => {
-    setNCustomers(10);
-    setUseCustomRn(false);
-    setRnIatText("");
-    setRnStText("");
-    setSeed("");
-    setRows(null);
-    setSummary(null);
-    setError(null);
-    setRunKey((k) => k + 1);
-  };
+rows_df: Optional[pd.DataFrame] = None
+summ_df: Optional[pd.DataFrame] = None
 
-  return (
-    <div className="min-h-screen bg-gradient-to-b from-white to-slate-50 text-slate-900">
-      <div className="mx-auto max-w-6xl p-6 space-y-6">
-        {/* Header */}
-        <header className="flex items-center justify-between">
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">Single-Server Queue Simulator</h1>
-            <p className="text-sm text-slate-500 mt-1">
-              Excel-like discrete event simulation with a clean UI — ported from your Python logic.
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={reset}>
-              <RotateCcw className="h-4 w-4 mr-2" /> Reset
-            </Button>
-            <Button onClick={run}>
-              <Play className="h-4 w-4 mr-2" /> Run Simulation
-            </Button>
-          </div>
-        </header>
+if run:
+    try:
+        rn_iat = parse_csv_ints(rn_iat_str) if (use_custom and rn_iat_str.strip()) else None
+        rn_st  = parse_csv_ints(rn_st_str)  if (use_custom and rn_st_str.strip())  else None
+        if use_custom:
+            if rn_iat is None or rn_st is None:
+                st.error("Both RN lists are required when 'Provide custom RN lists' is ON.")
+                st.stop()
+            if len(rn_iat) != n_customers or len(rn_st) != n_customers:
+                st.error(f"Provided RN lengths (IAT={len(rn_iat)}, ST={len(rn_st)}) do not match n={n_customers}.")
+                st.stop()
+        df = simulate_queue(SimulationInput(n_customers=n_customers, rn_iat=rn_iat, rn_st=rn_st))
+        rows_df = df
+        summ_df = compute_summaries(df)
+    except Exception as e:
+        st.error(f"Error: {e}")
 
-        {/* Controls */}
-        <Card className="rounded-2xl shadow-sm">
-          <CardContent className="p-6 space-y-6">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div>
-                <Label htmlFor="n">Number of customers</Label>
-                <Input
-                  id="n"
-                  type="number"
-                  min={1}
-                  value={nCustomers}
-                  onChange={(e) => setNCustomers(parseInt(e.target.value || "1", 10))}
-                  className="mt-2"
-                />
-              </div>
-              <div>
-                <Label htmlFor="seed">Random seed (optional)</Label>
-                <Input
-                  id="seed"
-                  placeholder="e.g. 42"
-                  value={seed}
-                  onChange={(e) => setSeed(e.target.value)}
-                  className="mt-2"
-                />
-                <p className="text-xs text-slate-500 mt-1">Use a seed for reproducible random numbers.</p>
-              </div>
-              <div className="flex items-end gap-3">
-                <div className="space-y-1">
-                  <Label>Custom RN input</Label>
-                  <div className="flex items-center gap-3 mt-1">
-                    <Switch checked={useCustomRn} onCheckedChange={setUseCustomRn} />
-                    <span className="text-sm">Provide RN lists</span>
-                  </div>
-                </div>
-              </div>
-            </div>
+# Show output
+if rows_df is not None and summ_df is not None:
+    # KPIs
+    c1, c2, c3, c4, c5 = st.columns(5)
+    # Extract values cleanly
+    avg_wait = float(rows_df["Wait"].mean())
+    max_wait = int(rows_df["Wait"].max())
+    total_idle = int(rows_df["ServerIdle"].sum())
+    total_service = int(rows_df["ST"].sum())
+    utilization = (total_service / (total_service + total_idle)) if (total_service + total_idle) > 0 else 0.0
+    horizon_end = int(rows_df["TSE"].iloc[-1])
 
-            <Tabs defaultValue="random" value={useCustomRn ? "custom" : "random"}>
-              <TabsList>
-                <TabsTrigger value="random" onClick={() => setUseCustomRn(false)}>Random RN</TabsTrigger>
-                <TabsTrigger value="custom" onClick={() => setUseCustomRn(true)}>Custom RN</TabsTrigger>
-              </TabsList>
-              <TabsContent value="random" className="pt-4">
-                <div className="text-sm text-slate-500 flex items-center gap-2"><Info className="h-4 w-4"/> If you don’t provide RN lists, the simulator will generate them uniformly: IAT (1..1000), ST (1..100).</div>
-              </TabsContent>
-              <TabsContent value="custom" className="pt-4">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <Label htmlFor="rnIat">RN for IAT (1..1000)</Label>
-                    <Textarea
-                      id="rnIat"
-                      placeholder="e.g. 12, 845, 310, 999, ..."
-                      value={rnIatText}
-                      onChange={(e) => setRnIatText(e.target.value)}
-                      className="mt-2 h-28"
-                    />
-                  </div>
-                  <div>
-                    <Label htmlFor="rnSt">RN for ST (1..100)</Label>
-                    <Textarea
-                      id="rnSt"
-                      placeholder="e.g. 5, 88, 60, 17, ..."
-                      value={rnStText}
-                      onChange={(e) => setRnStText(e.target.value)}
-                      className="mt-2 h-28"
-                    />
-                  </div>
-                </div>
-                <p className="text-xs text-slate-500 mt-2">Comma or newline separated. Length of both lists must equal the number of customers.</p>
-              </TabsContent>
-            </Tabs>
+    c1.metric("Avg wait", f"{avg_wait:.2f}")
+    c2.metric("Max wait", f"{max_wait}")
+    c3.metric("Total idle", f"{total_idle}")
+    c4.metric("Utilization", f"{utilization*100:.2f}%")
+    c5.metric("Horizon end", f"{horizon_end}")
 
-            {error && (
-              <div className="text-sm text-red-600">{error}</div>
-            )}
-          </CardContent>
-        </Card>
+    st.divider()
 
-        {/* Summary */}
-        {summary && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
-            <Kpi title="Avg wait" value={`${toFixed2(summary.avgWait)}`} suffix="" />
-            <Kpi title="Max wait" value={`${summary.maxWait}`} />
-            <Kpi title="Total idle" value={`${summary.totalIdle}`} />
-            <Kpi title="Utilization" value={`${(summary.utilization * 100).toFixed(2)}%`} />
-            <Kpi title="Horizon end" value={`${summary.horizonEnd}`} />
-          </div>
-        )}
+    # Charts
+    left, right = st.columns(2)
 
-        {/* Charts */}
-        {rows && rows.length > 0 && (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <Card className="rounded-2xl shadow-sm">
-              <CardContent className="p-6">
-                <h3 className="text-lg font-semibold mb-4">Wait time by customer</h3>
-                <ResponsiveContainer width="100%" height={280}>
-                  <BarChart data={rows}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="Cust" />
-                    <YAxis />
-                    <Tooltip />
-                    <Legend />
-                    <Bar dataKey="Wait" name="Wait" />
-                  </BarChart>
-                </ResponsiveContainer>
-              </CardContent>
-            </Card>
-            <Card className="rounded-2xl shadow-sm">
-              <CardContent className="p-6">
-                <h3 className="text-lg font-semibold mb-4">Timeline (TSE)</h3>
-                <ResponsiveContainer width="100%" height={280}>
-                  <LineChart data={rows}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="Cust" />
-                    <YAxis />
-                    <Tooltip />
-                    <Legend />
-                    <Line type="monotone" dataKey="TSE" name="TSE" />
-                  </LineChart>
-                </ResponsiveContainer>
-              </CardContent>
-            </Card>
-          </div>
-        )}
+    with left:
+        st.subheader("Wait time by customer")
+        chart_wait = (
+            alt.Chart(rows_df)
+            .mark_bar()
+            .encode(x=alt.X("Cust:O", title="Customer"), y=alt.Y("Wait:Q", title="Wait"), tooltip=["Cust", "Wait"])
+            .properties(height=300)
+        )
+        st.altair_chart(chart_wait, use_container_width=True)
 
-        {/* Table */}
-        {rows && (
-          <Card className="rounded-2xl shadow-sm">
-            <CardContent className="p-6 overflow-x-auto">
-              <h3 className="text-lg font-semibold mb-4">Results Table</h3>
-              <table className="min-w-full text-sm">
-                <thead>
-                  <tr className="text-left border-b">
-                    {[
-                      "Cust",
-                      "RN_IAT(1-1000)",
-                      "IAT",
-                      "Arrival",
-                      "RN_ST(1-100)",
-                      "ST",
-                      "TSB",
-                      "Wait",
-                      "TSE",
-                      "TimeInSystem",
-                      "ServerIdle",
-                    ].map((h) => (
-                      <th key={h} className="py-2 pr-4 font-medium text-slate-600">{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((r) => (
-                    <tr key={r.Cust} className="border-b hover:bg-slate-50/70">
-                      <td className="py-2 pr-4">{r.Cust}</td>
-                      <td className="py-2 pr-4">{r.RN_IAT}</td>
-                      <td className="py-2 pr-4">{r.IAT}</td>
-                      <td className="py-2 pr-4">{r.Arrival}</td>
-                      <td className="py-2 pr-4">{r.RN_ST}</td>
-                      <td className="py-2 pr-4">{r.ST}</td>
-                      <td className="py-2 pr-4">{r.TSB}</td>
-                      <td className="py-2 pr-4">{r.Wait}</td>
-                      <td className="py-2 pr-4">{r.TSE}</td>
-                      <td className="py-2 pr-4">{r.TimeInSystem}</td>
-                      <td className="py-2 pr-4">{r.ServerIdle}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </CardContent>
-          </Card>
-        )}
+    with right:
+        st.subheader("Timeline (TSE)")
+        chart_tse = (
+            alt.Chart(rows_df)
+            .mark_line(point=True)
+            .encode(x=alt.X("Cust:O", title="Customer"), y=alt.Y("TSE:Q", title="TSE"), tooltip=["Cust", "TSE"])
+            .properties(height=300)
+        )
+        st.altair_chart(chart_tse, use_container_width=True)
 
-        {/* Footer note */}
-        <p className="text-xs text-slate-500 text-center pb-8">
-          Mapping buckets: IAT RN 1..1000 → 1..8; ST RN 1..100 → 1..6. First arrival starts at time 0.
-        </p>
-      </div>
-    </div>
-  );
-}
+    st.subheader("Wait time distribution")
+    chart_hist = (
+        alt.Chart(rows_df)
+        .mark_bar()
+        .encode(
+            alt.X("Wait:Q", bin=alt.Bin(maxbins=20), title="Wait"),
+            alt.Y("count()", title="Count"),
+            tooltip=[alt.Tooltip("count()", title="Count")]
+        )
+        .properties(height=220)
+    )
+    st.altair_chart(chart_hist, use_container_width=True)
 
-function Kpi({ title, value, suffix }: { title: string; value: string; suffix?: string }) {
-  return (
-    <Card className="rounded-2xl shadow-sm">
-      <CardContent className="p-5">
-        <div className="text-xs uppercase tracking-wide text-slate-500">{title}</div>
-        <div className="text-2xl font-semibold mt-1">{value}{suffix ?? ""}</div>
-      </CardContent>
-    </Card>
-  );
-}
+    st.divider()
 
+    # Tables
+    st.subheader("Results Table")
+    st.dataframe(rows_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Summaries")
+    st.table(summ_df)
+
+    # Downloads
+    st.divider()
+    st.subheader("Downloads")
+    results_csv = rows_df.to_csv(index=False).encode("utf-8")
+    summaries_csv = summ_df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download results CSV", data=results_csv, file_name="simulation_results.csv", mime="text/csv")
+    st.download_button("Download summaries CSV", data=summaries_csv, file_name="simulation_summaries.csv", mime="text/csv")
+
+# Footer
+st.caption("Mapping buckets: IAT RN 1..1000 → 1..8; ST RN 1..100 → 1..6. First arrival starts at time 0.")
